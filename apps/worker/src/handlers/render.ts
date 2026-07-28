@@ -28,7 +28,7 @@ import {
   logEvent,
   setVideoStatus,
 } from '../db';
-import { probeDimensions, probeDurationS, probeVideoCodec, run, runFfmpeg } from '../render/exec';
+import { probeDimensions, probeDurationS, run, runFfmpeg } from '../render/exec';
 import {
   buildRenderPlan,
   buildThumbnailArgs,
@@ -72,6 +72,14 @@ interface RenderResult {
     meta?: Record<string, unknown>;
   };
 }
+
+/**
+ * A keyframe every 30 frames (1s). HyperFrames seeks each media element once
+ * per output frame in headless Chrome; with the 10s GOP HeyGen and WaveSpeed
+ * ship, a seek lands far from a keyframe, the decode does not finish in time
+ * and that layer renders blank — hyperframes' own compiler warns about it.
+ */
+const DENSE_KEYFRAMES = ['-g', '30', '-keyint_min', '30'];
 
 const HF_ASSET_CONTENT_TYPES: Record<string, string> = {
   '.mp4': 'video/mp4',
@@ -240,23 +248,24 @@ export async function handleRender(job: Job): Promise<void> {
       ]);
       outroPath = fitted;
     }
-    // Normalize uploaded outro videos to H.264-in-mp4. The hyperframes engine
-    // plays media in headless Chrome, which can't decode HEVC (the default for
-    // iPhone/Mac exports) or QuickTime containers — the outro silently renders
-    // as black frames while ffprobe still reports the right duration.
-    if (outroPath && /\.(mp4|mov)$/i.test(outroPath)) {
-      const codec = await probeVideoCodec(outroPath);
-      if (codec !== 'h264' || /\.mov$/i.test(outroPath)) {
-        const normalized = path.join(tmpDir, 'outro_h264.mp4');
-        await runFfmpeg([
-          '-y', '-i', outroPath,
-          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '18',
-          '-c:a', 'aac',
-          '-movflags', '+faststart',
-          normalized,
-        ]);
-        outroPath = normalized;
-      }
+    // Normalize uploaded outro videos to H.264-in-mp4 with dense keyframes.
+    // The hyperframes engine plays media in headless Chrome, which can't decode
+    // HEVC (the default for iPhone/Mac exports) or QuickTime containers — the
+    // outro silently renders as black frames while ffprobe still reports the
+    // right duration. Chrome also re-seeks the clip for every output frame, so
+    // a long GOP leaves it decoding from the same distant keyframe each time
+    // and the layer comes out blank; always re-encode rather than probe.
+    if (outroPath && /\.(mp4|mov|webm)$/i.test(outroPath)) {
+      const normalized = path.join(tmpDir, 'outro_h264.mp4');
+      await runFfmpeg([
+        '-y', '-i', outroPath,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '18',
+        ...DENSE_KEYFRAMES,
+        '-c:a', 'aac',
+        '-movflags', '+faststart',
+        normalized,
+      ]);
+      outroPath = normalized;
     }
     const bgmPath = bgm
       ? await download(tmpDir, bgm.r2_key, `bgm${path.extname(bgm.r2_key) || '.mp3'}`)
@@ -352,10 +361,10 @@ export async function handleRender(job: Job): Promise<void> {
       // before its window ends — the element goes blank and the avatar base
       // shows through. Pre-fit short clips the same way the ffmpeg engine
       // does: slow down up to 1.25x, then clone the last frame to the window.
+      // Clips that already fit still get re-encoded, for the keyframes.
       const fitSceneClip = async (s: RenderSceneInput, i: number): Promise<string> => {
         const windowDur = s.windowEnd - s.windowStart;
         const { setptsFactor, tpadSeconds } = fitClipToWindow(s.durationS, windowDur);
-        if (setptsFactor === 1 && tpadSeconds <= 0.01) return s.path;
         const vf: string[] = [];
         if (setptsFactor !== 1) vf.push(`setpts=${setptsFactor.toFixed(4)}*PTS`);
         if (tpadSeconds > 0.01) {
@@ -364,16 +373,29 @@ export async function handleRender(job: Job): Promise<void> {
         const fitted = path.join(tmpDir, `scene_fit_${i + 1}.mp4`);
         await runFfmpeg([
           '-y', '-i', s.path,
-          '-vf', vf.join(','),
+          ...(vf.length > 0 ? ['-vf', vf.join(',')] : []),
           '-an',
           '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
+          ...DENSE_KEYFRAMES,
           fitted,
         ]);
         return fitted;
       };
 
+      // Same treatment for the avatar — it backs two layers (the full-screen
+      // base and the presenter bubble), and HeyGen ships it with a 10s GOP.
+      const denseAvatarPath = path.join(tmpDir, 'avatar_kf.mp4');
+      await runFfmpeg([
+        '-y', '-i', avatarPath,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '20',
+        ...DENSE_KEYFRAMES,
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        denseAvatarPath,
+      ]);
+
       const comp = buildHfComposition({
-        avatarFile: await stage(avatarPath),
+        avatarFile: await stage(denseAvatarPath),
         avatarDurationS,
         scenes: await Promise.all(
           scenes.map(async (s, i) => ({
@@ -416,7 +438,7 @@ export async function handleRender(job: Job): Promise<void> {
         mainDurationS: comp.mainDurationS,
         outroDurationS: comp.outroDurationS,
         outroPath,
-        avatarPath,
+        avatarPath: denseAvatarPath,
         template,
       });
       if (broken) throw new Error(`hyperframes output failed verification: ${broken}`);
