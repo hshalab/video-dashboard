@@ -75,12 +75,13 @@ export function normalizeJobPayload(job: Job): Job {
   return { ...job, payload: (p ?? {}) as Record<string, unknown> };
 }
 
-export async function claimJobs(limit: number): Promise<Job[]> {
+export async function claimJobs(limit: number, types?: JobType[]): Promise<Job[]> {
   const s = db();
   const claimed = await s.begin(async (tx) => {
     const jobs = await tx<Job[]>`
       select * from jobs
       where status = 'queued' and run_after <= now()
+        and (${types ?? null}::text[] is null or type = any(${types ?? null}::text[]))
       order by created_at
       limit ${limit}
       for update skip locked

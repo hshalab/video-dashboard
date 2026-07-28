@@ -37,7 +37,11 @@ const handlers: Record<JobType, (job: Job) => Promise<void>> = {
   ghl_post: handleGhlPost,
 };
 
+/** Everything except 'render' — claimed freely up to WORKER_CONCURRENCY. */
+const LIGHT_JOB_TYPES = (Object.keys(handlers) as JobType[]).filter((t) => t !== 'render');
+
 let stopping = false;
+let renderInFlight = false;
 const inFlight = new Set<Promise<void>>();
 let lastPostsCheck = 0;
 let lastPostersCheck = 0;
@@ -129,9 +133,19 @@ async function checkScheduledPosts(): Promise<void> {
 async function tick(): Promise<void> {
   const capacity = workerConcurrency() - inFlight.size;
   if (capacity > 0) {
-    const jobs = await claimJobs(capacity);
+    const jobs = await claimJobs(capacity, LIGHT_JOB_TYPES);
+    // One render at a time. A render runs headless Chrome plus ffmpeg on a
+    // 1080x1920 timeline; two in one container starve Chrome's video decoder,
+    // which then ships layers that never decoded (black outro, no bubble).
+    if (jobs.length < capacity && !renderInFlight) {
+      jobs.push(...(await claimJobs(1, ['render'])));
+    }
     for (const job of jobs) {
-      const p: Promise<void> = runJob(job).finally(() => inFlight.delete(p));
+      if (job.type === 'render') renderInFlight = true;
+      const p: Promise<void> = runJob(job).finally(() => {
+        inFlight.delete(p);
+        if (job.type === 'render') renderInFlight = false;
+      });
       inFlight.add(p);
     }
   }

@@ -36,6 +36,7 @@ import {
   type RenderSceneInput,
 } from '../render/render';
 import { buildHfComposition, hfProjectFiles } from '../render/hyperframes';
+import { verifyHfRender } from '../render/verify';
 
 /** Bundled fonts (apps/worker/fonts) — see README; DejaVu Sans is the fallback. */
 function bundledFontsDir(): string | null {
@@ -407,6 +408,19 @@ export async function handleRender(job: Job): Promise<void> {
         { cwd: hfDir },
       );
 
+      // Chrome silently drops a video layer it failed to decode (black outro,
+      // missing bubble) and still exits 0 — check the pixels before publishing.
+      const broken = await verifyHfRender({
+        outPath,
+        tmpDir,
+        mainDurationS: comp.mainDurationS,
+        outroDurationS: comp.outroDurationS,
+        outroPath,
+        avatarPath,
+        template,
+      });
+      if (broken) throw new Error(`hyperframes output failed verification: ${broken}`);
+
       // Publish the staged media so the composition stays editable and
       // re-renderable (see renderFromComposition). Only after a successful
       // render — an ffmpeg fallback must not leave a half-published project.
@@ -446,13 +460,24 @@ export async function handleRender(job: Job): Promise<void> {
       try {
         result = await renderWithHyperframes();
       } catch (e) {
-        // Never block the pipeline on the new engine — fall back to ffmpeg.
-        console.error(`[render] video ${video.id}: hyperframes failed, falling back to ffmpeg:`, e);
-        await logEvent(video.id, 'render_engine_fallback', {
+        // Chrome-side failures (crash, dropped video layer) are transient, so
+        // retry once before giving up the editable composition for ffmpeg.
+        console.error(`[render] video ${video.id}: hyperframes failed, retrying once:`, e);
+        await logEvent(video.id, 'render_engine_retry', {
           job_id: job.id,
           error: String(e).slice(0, 2000),
         });
-        result = await renderWithFfmpeg();
+        try {
+          result = await renderWithHyperframes();
+        } catch (e2) {
+          // Never block the pipeline on the new engine — fall back to ffmpeg.
+          console.error(`[render] video ${video.id}: hyperframes failed twice, using ffmpeg:`, e2);
+          await logEvent(video.id, 'render_engine_fallback', {
+            job_id: job.id,
+            error: String(e2).slice(0, 2000),
+          });
+          result = await renderWithFfmpeg();
+        }
       }
     } else {
       result = await renderWithFfmpeg();
